@@ -627,6 +627,16 @@ test('an iMessage final reply survives restart and goes only to its matching tur
     await new Promise(resolve => setImmediate(resolve));
     await hook('phone-turn', 'No.');
     assert.deepEqual(actions.slice(-3), [['typing', true], ['typing', false], ['reaction', 'second', 'dislike']]);
+    receive!({ type: 'message', from: config.USER_PHONE_NUMBER, messageId: 'push', text: 'Push this to GitHub.' });
+    await new Promise(resolve => setImmediate(resolve));
+    const modelHook = (turn_id: string) => handleHook({
+      session_id: 'chat', cwd: '/workspace', hook_event_name: 'PreToolUse', turn_id,
+    });
+    assert.deepEqual(await modelHook('other-turn'), {});
+    assert.match((await modelHook('phone-turn')).hookSpecificOutput?.additionalContext ?? '', /verified routine success/);
+    assert.deepEqual(await modelHook('phone-turn'), {});
+    await hook('phone-turn', '👍');
+    assert.deepEqual(actions.slice(-3), [['typing', true], ['typing', false], ['reaction', 'push', 'like']]);
     const reminder = 'Keep .env out of Git';
     receive!({ type: 'message', from: config.USER_PHONE_NUMBER, messageId: 'third', text: reminder });
     const response = await fetch(`http://127.0.0.1:${process.env.PORT}/internal/react`, {

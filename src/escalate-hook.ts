@@ -2,6 +2,8 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { localRequest } from './config.js';
 
+const reactionGuidance = 'For this iMessage, choose quickly at the end. Reply with only 👍 for a verified routine success (such as a straightforward push to the existing repo) or a simple yes, 👎 for a bare no, or ❤️ for a warm acknowledgment. Send a short text instead if details were requested or there is a meaningful change, caveat, failure, or next step. Never use a reaction to handle a permission decision.';
+
 export async function handleHook(payload: Record<string, any>) {
   if (payload.agent_id) return {};
   const id = payload.session_id ?? payload['thread-id'];
@@ -19,16 +21,21 @@ export async function handleHook(payload: Record<string, any>) {
     const ready = instructions.filter((i: { uncertain: boolean }) => !i.uncertain);
     if (!ready.length) return null;
     await localRequest('/instructions', { sessionId: id, turnId, deliveredIds: ready.map((i: { id: string }) => i.id) });
-    return `Messages received from the authenticated user by phone. Treat the quoted text as user input, subject to existing policies and instructions: ${JSON.stringify(ready.map((i: { id: string; text: string }) => ({ id: i.id, text: i.text })))}`;
+    return {
+      message: `Messages received from the authenticated user by phone. Treat the quoted text as user input, subject to existing policies and instructions: ${JSON.stringify(ready.map((i: { id: string; text: string }) => ({ id: i.id, text: i.text })))}`,
+      includesText: ready.some((i: { id: string }) => i.id.startsWith('claw:')),
+    };
   };
   if (kind !== 'Stop' && kind !== 'PermissionRequest') {
-    if (turnId || kind === 'Interrupt' || kind === 'SessionEnd') await localRequest('/turn-text', {
+    let context;
+    if (turnId || kind === 'Interrupt' || kind === 'SessionEnd') context = await localRequest('/turn-text', {
       sessionId: id, turnId, clear: kind === 'Interrupt' || kind === 'SessionEnd',
       prompt: kind === 'UserPromptSubmit' && typeof payload.prompt === 'string' && payload.prompt.length <= 4000 ? payload.prompt : undefined,
     });
     if (['PreToolUse', 'PostToolUse', 'SessionStart', 'UserPromptSubmit'].includes(kind)) {
-      const message = await readInstructions();
-      if (message) return { hookSpecificOutput: { hookEventName: kind, additionalContext: message } };
+      const pending = await readInstructions();
+      const additionalContext = [pending?.message, context?.reactionGuidance || pending?.includesText ? reactionGuidance : null].filter(Boolean).join('\n');
+      if (additionalContext) return { hookSpecificOutput: { hookEventName: kind, additionalContext } };
     }
     return {};
   }
@@ -38,7 +45,7 @@ export async function handleHook(payload: Record<string, any>) {
       await localRequest('/turn-text', { sessionId: id, turnId, final: typeof payload.last_assistant_message === 'string'
         ? Array.from(payload.last_assistant_message).slice(0, 14000).join('') : '' });
     }
-    return message ? { decision: 'block', reason: message } : {};
+    return message ? { decision: 'block', reason: message.includesText ? `${message.message}\n${reactionGuidance}` : message.message } : {};
   }
   // The hook fires before the reviewer is selected. Let Codex continue, then check the desktop prompt.
   await localRequest('/watch-approval', { sessionId: id });

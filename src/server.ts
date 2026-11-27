@@ -240,8 +240,14 @@ export function createBridge(c: Config, router: Router, providers = new Provider
     }
     if (clear) { activeTurns.delete(id); if (replies.delete(id)) { saveReplies(); updateTyping(); } }
     const reply = replies.get(id);
+    let reactionGuidance = false;
     if (reply && turnId) {
       if (prompt && reply.text === prompt.trim() && !reply.turnId) { reply.turnId = turnId; saveReplies(); }
+      if (final === undefined && reply.turnId === turnId && reply.replyGuidanceTurn !== turnId && !reply.reaction) {
+        reply.replyGuidanceTurn = turnId;
+        saveReplies();
+        reactionGuidance = true;
+      }
       if (final !== undefined && reply.turnId === turnId && reply.finalText === undefined) {
         if (session) session.notifiedDoneTurn = turnId;
         if (reply.reaction !== 'final' && final.trim()) reply.finalText = final.trim();
@@ -257,7 +263,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
         flushDone(id);
       }
     }
-    res.json({ ok: true });
+    res.json({ ok: true, reactionGuidance });
   });
   function flushDone(id: string) {
     const session = router.state.sessions[id];

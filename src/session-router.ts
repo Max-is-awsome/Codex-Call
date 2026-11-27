@@ -22,6 +22,7 @@ const instruction = z.object({ id: z.string(), sessionId: z.string(), text: z.st
 const mirror = z.object({
   messageId: z.string(), text: z.string(), receivedAt: z.number(), turnId: z.string().optional(),
   reaction: z.enum(['acknowledgment', 'final']).optional(), finalText: z.string().optional(),
+  replyGuidanceTurn: z.string().optional(),
 });
 export type MirroredReply = z.infer<typeof mirror>;
 const schema = z.object({ version: z.literal(1), sessions: z.record(z.string(), session), events: z.record(z.string(), event), instructions: z.array(instruction),
