@@ -2,9 +2,17 @@ import WebSocket, { type ClientOptions } from 'ws';
 import { z } from 'zod';
 import type { Config } from './config.js';
 import { openFlux } from './deepgram-flux.js';
+import { effortLevels } from './codex-client.js';
+
+const voiceSettings = z.object({
+  model: z.string().trim().min(1).max(100).optional(),
+  effort: z.enum(Object.keys(effortLevels) as (keyof typeof effortLevels)[]).optional(),
+}).strict().refine(settings => Boolean(settings.model || settings.effort));
 
 export type VoiceContext = { callSid: string; sessionId: string; eventId?: string; question?: string; approval?: boolean };
 export type VoiceActions = {
+  usage?: () => Promise<unknown>;
+  changeSettings?: (settings: z.infer<typeof voiceSettings>) => Promise<unknown>;
   sessions?: () => Promise<unknown>;
   switchSession?: (reference: string, id: string, workspace?: string) => Promise<{ switched: boolean; title?: string }>;
   status: () => Promise<unknown>;
@@ -247,6 +255,15 @@ export function bridgeVoice(phone: WebSocket, config: Config, context: VoiceCont
           audio: { input: { format: { type: 'audio/pcmu' }, turn_detection: callerTurnDetection },
             ...(useExternalSpeech ? {} : { output: { format: { type: 'audio/pcmu' }, voice: 'marin' } }) },
           tools: [
+            ...(actions.usage ? [{
+              type: 'function', name: 'get_usage', description: 'Read account-wide Codex usage when asked how much usage is left. Report both five-hour and weekly percentages remaining; null means unavailable. This does not require a selected session.',
+              parameters: { type: 'object', properties: {}, additionalProperties: false },
+            }] : []),
+            ...(actions.changeSettings ? [{
+              type: 'function', name: 'change_settings',
+              description: 'When the caller explicitly asks to change the Codex model or reasoning effort, change the settings of the session selected on this call for its next turn. This is different from switching chats or changing the phone voice. For “switch to GPT 6 Astra high effort,” send model “6 astra” and effort “high” together. Interpret Asta as Astra in a model name. Normalize spoken model versions, such as six point two to 6.2. Light means low. Only include explicitly requested settings. Ask for clarification if unsure. Confirm only when the tool succeeds.',
+              parameters: { type: 'object', properties: { model: { type: 'string' }, effort: { type: 'string', enum: Object.keys(effortLevels) } }, additionalProperties: false },
+            }] : []),
             ...(actions.sessions && actions.switchSession ? [
               { type: 'function', name: 'list_sessions', description: 'List Codex session titles and IDs. Use this whenever the caller asks to list or switch sessions. Ask which one if their reference matches multiple sessions.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
               { type: 'function', name: 'switch_session', description: 'Switch this call only. Use only after the caller explicitly asks and you identify one session from list_sessions. Pass its exact title and ID. If titles match, first ask the caller to clarify which workspace, then pass its exact workspace path as well. After switching, fetch status if needed. The original call question stays with its original session.', parameters: { type: 'object', properties: { title: { type: 'string' }, id: { type: 'string' }, workspace: { type: 'string' } }, required: ['title', 'id'], additionalProperties: false } },
@@ -287,6 +304,11 @@ export function bridgeVoice(phone: WebSocket, config: Config, context: VoiceCont
                 if (!callerSpoke) throw new Error('No speech received');
                 const args = JSON.parse(e.arguments);
                 if (e.name === 'get_session_status') result = await actions.status();
+                else if (e.name === 'get_usage' && actions.usage) {
+                  z.object({}).strict().parse(args);
+                  result = await actions.usage();
+                }
+                else if (e.name === 'change_settings' && actions.changeSettings) result = await actions.changeSettings(voiceSettings.parse(args));
                 else if (e.name === 'list_sessions' && actions.sessions) result = await actions.sessions();
                 else if (e.name === 'switch_session' && actions.switchSession) {
                   const target = z.object({ title: z.string().trim().min(1).max(100), id: z.string().uuid(), workspace: z.string().max(4096).optional() }).strict().parse(args);

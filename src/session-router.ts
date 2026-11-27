@@ -28,6 +28,7 @@ const schema = z.object({ version: z.literal(1), sessions: z.record(z.string(), 
   statusTexts: z.array(z.object({ messageId: z.string(), sessionId: z.string() })).optional(),
   mirroredReplies: z.record(z.string(), mirror).optional(),
   selectedSessionId: z.string().optional(),
+  textSessionId: z.string().optional(),
   sessionMenu: z.array(z.string()).optional(),
   handledMenuMessages: z.array(z.string()).optional(),
 });
@@ -59,6 +60,10 @@ export class Router {
     const id = this.state.selectedSessionId;
     return id ? this.state.sessions[id] : undefined;
   }
+  textTarget() {
+    const id = this.state.textSessionId ?? this.state.selectedSessionId;
+    return id ? this.state.sessions[id] : undefined;
+  }
   rememberSession(choice: SessionChoice) {
     const previous = this.state.sessions[choice.id];
     this.state.sessions[choice.id] = {
@@ -69,6 +74,7 @@ export class Router {
   select(choice: SessionChoice) {
     this.rememberSession(choice);
     this.state.selectedSessionId = choice.id;
+    this.state.textSessionId = undefined;
     this.state.sessionMenu = undefined;
     this.save();
   }
@@ -123,14 +129,15 @@ export class Router {
     const events = Object.values(this.state.events);
     if (events.some(e => e.clawReplyId === message.messageId || e.clawMessageId === message.messageId)) return;
     const [ , reference, referencedText ] = message.text.trim().match(/^([a-f0-9]{8})\s+([\s\S]+)$/i) ?? [];
-    if (!message.replyTo && !reference && !this.state.selectedSessionId) {
+    const targetId = this.textTarget()?.id;
+    if (!message.replyTo && !reference && !targetId) {
       const waiting = new Set(events.filter(e => e.kind === 'question' && !e.cancelled && !e.acknowledged && e.reply === null
         && Date.now() - e.createdAt < questionLifetimeMs && (e.clawSentAt || e.clawMessageId)).map(e => e.sessionId));
       if (waiting.size > 1) return;
     }
     const e = events.reverse().find(e => e.kind !== 'stop' && !e.key.startsWith('desktop-approval:') && (message.replyTo ? message.replyTo.messageId === e.clawMessageId
       : reference ? reference.toLowerCase() === e.id.slice(0, 8)
-      : !e.cancelled && !e.acknowledged && e.reply === null && (!this.state.selectedSessionId || e.sessionId === this.state.selectedSessionId)));
+      : !e.cancelled && !e.acknowledged && e.reply === null && (!targetId || e.sessionId === targetId)));
     const sent = message.sentAt ? Date.parse(message.sentAt) : undefined;
     if (!e || e.cancelled || e.acknowledged || e.reply !== null || Date.now() - e.createdAt >= (e.kind === 'question' ? questionLifetimeMs : 3600000)
       || (!message.replyTo && !reference && !e.clawSentAt && !e.clawMessageId)
@@ -153,11 +160,11 @@ export class Router {
     const referenced = message.replyTo && (Object.values(this.state.events).find(e => e.clawMessageId === message.replyTo!.messageId)
       ?? this.state.statusTexts?.find(e => e.messageId === message.replyTo!.messageId));
     if (message.replyTo && !referenced) return;
-    const session = referenced ? this.state.sessions[referenced.sessionId] : this.selected();
+    const session = referenced ? this.state.sessions[referenced.sessionId] : this.textTarget();
     if (!session || session.ended) return;
     return this.queue(session.id, text, id);
   }
-  rememberStatusText(messageId: string, sessionId = this.selected()?.id) {
+  rememberStatusText(messageId: string, sessionId = this.textTarget()?.id) {
     if (!sessionId) return;
     this.state.statusTexts = [...(this.state.statusTexts ?? []).slice(-167), { messageId, sessionId }];
     this.save();

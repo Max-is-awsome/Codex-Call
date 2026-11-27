@@ -7,6 +7,7 @@ import { deliverToDesktop, desktopApprovals, desktopApprovalDetails, desktopDeci
 
 const listedSession = z.object({ id: z.string().uuid(), name: z.string().nullable(), cwd: z.string(), preview: z.string().optional() });
 export type SessionChoice = { id: string; title: string; cwd: string };
+export const effortLevels = { low: 'low', medium: 'medium', high: 'high', 'extra high': 'xhigh', ultra: 'ultra' } as const;
 const modelWords = (name: string) => name.toLowerCase().match(/[a-z]+|\d+(?:\.\d+)*/g)
   ?.filter(word => word !== 'gpt').sort().join(' ');
 
@@ -81,13 +82,33 @@ export class CodexClient {
   async status(threadId: string) {
     return this.withClient(async rpc => (await rpc('thread/read', { threadId, includeTurns: false })).thread);
   }
-  async setModel(threadId: string, input: string) {
+  async usage() {
+    return this.withClient(async rpc => {
+      const result = await rpc('account/rateLimits/read', { excludeResetCreditDetails: true });
+      const bucket = result.rateLimitsByLimitId?.codex ?? result.rateLimits;
+      const windows = [bucket?.primary, bucket?.secondary];
+      const used = (minutes: number) => {
+        const percent = windows.find(window => window?.windowDurationMins === minutes)?.usedPercent;
+        return typeof percent === 'number' && Number.isFinite(percent) && percent >= 0 ? percent : undefined;
+      };
+      return { fiveHour: used(300), weekly: used(10080) };
+    });
+  }
+  async startSession(cwd?: string): Promise<SessionChoice> {
+    return this.withClient(async rpc => {
+      const { thread } = await rpc('thread/start', { cwd, ephemeral: false });
+      const row = listedSession.parse(thread);
+      return { id: row.id, cwd: row.cwd, title: row.name?.trim() || 'New session' };
+    });
+  }
+  async setModel(threadId: string, input: string, effort?: string) {
     return this.withClient(async rpc => {
       const { thread } = await rpc('thread/read', { threadId, includeTurns: false });
       if (thread.id !== threadId) throw new Error('Selected chat is unavailable');
       const match = matchModel(input, await modelCatalog(rpc, thread.modelProvider));
       if (!match) return;
-      await this.updateSettings(rpc, threadId, { model: match.model });
+      if (effort && !match.supportedReasoningEfforts?.some(option => option.reasoningEffort === effort)) return null;
+      await this.updateSettings(rpc, threadId, { model: match.model, ...(effort ? { effort } : {}) });
       return match.displayName;
     });
   }

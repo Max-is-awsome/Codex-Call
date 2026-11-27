@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { serverConfig, projectRoot, type Config } from './config.js';
 import { Router, type BridgeEvent, type MirroredReply } from './session-router.js';
 import { Providers, equalSecret, validSignature, xml } from './providers.js';
-import { CodexClient, DeliveryError } from './codex-client.js';
+import { CodexClient, DeliveryError, effortLevels } from './codex-client.js';
 import { bridgeVoice, type VoiceContext } from './voice-session.js';
 import { Claw, replyReactions, type ClawMessage, type ReplyReaction } from './claw.js';
 import { latestUsageLimit, rolloutPath } from './usage-limit.js';
@@ -51,39 +51,66 @@ export function createBridge(c: Config, router: Router, providers = new Provider
     return reply;
   }
   let inbox = Promise.resolve();
+  let sessionSwitch = 0;
+  async function sendFromSession(id: string, body: string) {
+    const beforeSwitch = sessionSwitch;
+    const sent = await claw.send(body);
+    if (sessionSwitch === beforeSwitch) router.state.textSessionId = id;
+    const messageId = sent?.messageId ?? sent?.message_id;
+    if (typeof messageId === 'string') router.rememberStatusText(messageId, id);
+    else router.save();
+    return sent;
+  }
   async function handleText(message: ClawMessage) {
     const input = message.text.trim();
     const menu = router.state.sessionMenu;
-    const list = /^\/sessions$/i.test(input);
+    const list = /^\/sessions?$/i.test(input);
+    const start = /^\/sessions?\s+new$/i.test(input);
     if (router.state.handledMenuMessages?.includes(message.messageId)) return;
     const model = input.match(/^\/model(?:\s+([\s\S]+))?$/i);
     const effort = input.match(/^\/effort(?:\s+([\s\S]+))?$/i);
-    if (model || effort || list || (menu && /^(?:\d+|cancel)$/i.test(input))) {
+    const usage = /^\/usage$/i.test(input);
+    if (model || effort || list || start || usage || (menu && /^(?:\d+|cancel)$/i.test(input))) {
       if (message.sentAt && !Number.isFinite(Date.parse(message.sentAt))) return;
       if (message.sentAt && Date.now() - Date.parse(message.sentAt) > 3600000) return;
       const remember = () => {
         router.state.handledMenuMessages = [...(router.state.handledMenuMessages ?? []).slice(-199), message.messageId];
         router.save();
       };
-      if (model || effort) {
+      if (usage) {
         remember();
-        const selected = router.selected();
+        const limits = await codex.usage().catch(() => undefined);
+        if (!limits) { await claw.send('I couldn’t read your Codex usage right now. Try /usage again in a moment.'); return; }
+        const format = (percent: number | undefined) => percent === undefined ? 'unavailable' : `${percent}% used`;
+        await claw.send(`Codex usage\n5-hour limit: ${format(limits.fiveHour)}\nWeekly limit: ${format(limits.weekly)}`);
+      } else if (start) {
+        // Claim the incoming message first. A timed-out create may have succeeded.
+        remember();
+        let choice;
+        try { choice = await codex.startSession(router.textTarget()?.cwd || undefined); }
+        catch { await claw.send('I couldn’t confirm the new session. Check /sessions before trying again.'); return; }
+        router.select(choice);
+        sessionSwitch++;
+        await claw.send('New Codex session created and selected. Send your first message whenever you’re ready.');
+      } else if (model || effort) {
+        remember();
+        const selected = router.textTarget();
         if (!selected || selected.ended) { await claw.send('Choose a session with /sessions first.'); return; }
         if (effort) {
           const level = (effort[1] ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
-          if (!['low', 'medium', 'high', 'extra high', 'ultra'].includes(level)) {
+          if (!Object.hasOwn(effortLevels, level)) {
             await claw.send('Use /effort followed by low, medium, high, extra high, or ultra.');
             return;
           }
           let applied: boolean;
-          try { applied = await codex.setEffort(selected.id, level === 'extra high' ? 'xhigh' : level); }
+          try { applied = await codex.setEffort(selected.id, effortLevels[level as keyof typeof effortLevels]); }
           catch { await claw.send('I couldn’t confirm the effort change. Check the effort setting in Codex.'); return; }
           await claw.send(applied ? `Effort set to ${level} for the next turn.` : `The selected model doesn’t support ${level} effort.`);
           return;
         }
         if (!model) return;
         if (!model[1]?.trim() || model[1].length > 100) { await claw.send('Send /model followed by the model name.'); return; }
-        let name: string | undefined;
+        let name: string | null | undefined;
         try { name = await codex.setModel(selected.id, model[1]); }
         catch { await claw.send('I couldn’t confirm the model change. Check the model in Codex.'); return; }
         await claw.send(name ? `Model set to ${name} for the next turn.` : 'I couldn’t match that model name.');
@@ -95,7 +122,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
           router.state.sessionMenu = available.map(choice => choice.id);
         }
         remember();
-        const lines = router.state.sessionMenu!.map((id, index) => `${index + 1}. ${router.state.sessions[id]?.title ?? 'Unavailable session'}${router.state.selectedSessionId === id ? ' (selected)' : ''}`);
+        const lines = router.state.sessionMenu!.map((id, index) => `${index + 1}. ${router.state.sessions[id]?.title ?? 'Unavailable session'}${router.textTarget()?.id === id ? ' (selected)' : ''}`);
         let page = '';
         for (const line of [...lines, '', 'Reply with a number to switch, or cancel.']) {
           if (page.length + line.length > 1700) { await claw.send(page.trim()); page = ''; }
@@ -113,6 +140,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
         const choice = available.find(session => session.id === target);
         if (!choice) { await claw.send('That session is unavailable. Choose another number or cancel and reopen /sessions.'); return; }
         router.select(choice);
+        sessionSwitch++;
         remember();
         await claw.send(`Switched to ${choice.title}.`);
       }
@@ -131,7 +159,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
           console.info('[Claw] Follow-up', result.delivered ? 'accepted by Codex' : 'saved for a Codex hook');
           if (!result.delivered) await claw.send(result.message ?? 'Delivery is unconfirmed.');
         }).catch(() => console.error('[Claw] Follow-up delivery failed; message is queued'));
-      } else if (!message.replyTo && (!router.selected() || router.selected()?.ended)
+      } else if (!message.replyTo && (!router.textTarget() || router.textTarget()?.ended)
         && !router.state.instructions.some(item => item.id === `claw:${message.messageId}`)) {
         await claw.send('There’s no available session selected. Text /sessions to choose one.');
       }
@@ -237,7 +265,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
     session.notifiedDoneTurn = session.pendingDoneTurn;
     session.pendingDoneTurn = undefined;
     router.save();
-    void claw.send('Done').then(() => console.info('[Claw] Sent completion text'))
+    void sendFromSession(id, 'Done').then(() => console.info('[Claw] Sent completion text'))
       .catch(() => console.warn('[Claw] Completion text delivery failed'));
   }
   function flushFinal(id: string, reply: MirroredReply) {
@@ -261,9 +289,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
     }
     // Keep each message within the provider's text size and avoid splitting Unicode characters.
     for (const part of final.match(/[\s\S]{1,1800}/gu) ?? []) {
-      const sent = await claw.send(part);
-      const messageId = sent?.messageId ?? sent?.message_id;
-      if (typeof messageId === 'string') router.rememberStatusText(messageId, id);
+      await sendFromSession(id, part);
     }
     console.info('[Claw] Sent Codex final reply');
   }
@@ -298,7 +324,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
           ? e.approvalCommand ? 'React 👍 to approve once or 👎 to deny.' : 'Review it in Codex.'
           : 'Just text me back when you can.';
         const summary = e.kind === 'approval' ? e.question : e.question.slice(0, 1500);
-        void claw.send(`${alert}\n${summary}\n\n${options}`).then(result => {
+        void sendFromSession(e.sessionId, `${alert}\n${summary}\n\n${options}`).then(result => {
           const id = result?.messageId ?? result?.message_id;
           if (typeof id === 'string') e.clawMessageId = id;
           e.clawSentAt = Date.now();
@@ -430,6 +456,26 @@ export function createBridge(c: Config, router: Router, providers = new Provider
     console.info('SignalWire media upgrade accepted');
     let callSessionId = grant.sessionId;
     ws.handleUpgrade(req, socket, head, phone => bridgeVoice(phone, c, grant, {
+      usage: async () => {
+        const limits = await codex.usage();
+        const remaining = (used?: number) => used === undefined ? null : Math.max(0, Number((100 - used).toFixed(2)));
+        return { fiveHourPercentLeft: remaining(limits.fiveHour), weeklyPercentLeft: remaining(limits.weekly) };
+      },
+      changeSettings: async ({ model, effort }) => {
+        const id = callSessionId;
+        if (!router.state.sessions[id] || router.state.sessions[id].ended) {
+          return { error: 'Choose an available Codex session first.' };
+        }
+        const value = effort ? effortLevels[effort] : undefined;
+        if (model) {
+          const name = await codex.setModel(id, model, value);
+          if (name === null) return { error: 'That model does not support the requested effort. No settings changed.' };
+          if (!name) return { error: 'No unique model matched. Ask the caller for the model family and version.' };
+          return { model: name, effort, applies: 'next turn' };
+        }
+        if (!value || !await codex.setEffort(id, value)) return { error: 'The current model does not support that effort.' };
+        return { effort, applies: 'next turn' };
+      },
       sessions: async () => (await codex.sessions()).map(({id, title, cwd}) => ({ id, title, workspace: cwd, selected: id === callSessionId })),
       switchSession: async (query, id, workspace) => {
         const sessions = await codex.sessions();
@@ -476,7 +522,7 @@ export function createBridge(c: Config, router: Router, providers = new Provider
       if (!turn || router.state.sessions[session.id]?.alertedUsageTurn === turn) continue;
       router.state.sessions[session.id].alertedUsageTurn = turn;
       router.save();
-      await claw.send('Codex hit its usage limit while working on a task. That task is paused.')
+      await sendFromSession(session.id, 'Codex hit its usage limit while working on a task. That task is paused.')
         .catch(() => console.warn('[Claw] Usage limit alert delivery failed'));
     }
   }

@@ -49,7 +49,7 @@ test('model selection includes models on later catalog pages', async () => {
     calls.push([method, params]);
     if (method === 'thread/read') return { thread: { id: 'chat', modelProvider: 'provider' } };
     if (method === 'model/list') return request.cursor
-      ? { data: [{ model: 'gpt-6-luna', displayName: 'GPT-6-Luna' }] }
+      ? { data: [{ model: 'gpt-6-luna', displayName: 'GPT-6-Luna', supportedReasoningEfforts: [{ reasoningEffort: 'high' }] }] }
       : { data: [{ model: 'gpt-6.2-sol', displayName: 'GPT-6.2-Sol' }], nextCursor: 'next' };
     if (method === 'thread/list') return { data: [{ id: 'chat', name: 'Chat', cwd: '/workspace' }] };
     if (method === 'thread/settings/update') return {};
@@ -58,6 +58,11 @@ test('model selection includes models on later catalog pages', async () => {
   client.sessions = async () => [{ id: 'chat', title: 'Chat', cwd: '/workspace' }];
   assert.equal(await client.setModel('chat', 'luna 6'), 'GPT-6-Luna');
   assert.deepEqual(calls.at(-1), ['thread/settings/update', { threadId: 'chat', model: 'gpt-6-luna' }]);
+  assert.equal(await client.setModel('chat', 'luna 6', 'high'), 'GPT-6-Luna');
+  assert.deepEqual(calls.at(-1), ['thread/settings/update', { threadId: 'chat', model: 'gpt-6-luna', effort: 'high' }]);
+  const updates = calls.filter(call => (call as unknown[])[0] === 'thread/settings/update').length;
+  assert.equal(await client.setModel('chat', 'luna 6', 'ultra'), null);
+  assert.equal(calls.filter(call => (call as unknown[])[0] === 'thread/settings/update').length, updates);
 });
 
 test('usage alerts match recent top-level turn failures and ignore ordinary errors', async () => {
@@ -191,6 +196,12 @@ test('the session menu keeps its numbering and reactions return to the originati
     await settle();
   };
   try {
+    codex.usage = async () => ({ fiveHour: 0, weekly: 42 });
+    await send('/usage', 'usage-report');
+    await send('/usage', 'usage-report');
+    assert.equal(texts.filter(text => text.startsWith('Codex usage')).length, 1);
+    assert.equal(texts.at(-1), 'Codex usage\n5-hour limit: 0% used\nWeekly limit: 42% used');
+    assert.equal(router.selected(), undefined);
     await send('/sessions', 'menu');
     assert.match(texts.at(-1)!, /1\. First chat\n2\. Second chat/);
     assert.deepEqual(new Router(join(dir, 'state.json')).state.sessionMenu, ['first', 'second']);
@@ -222,6 +233,18 @@ test('the session menu keeps its numbering and reactions return to the originati
     assert.deepEqual(decisions, [['first', 'desktop-approval:7', 'npm test', false]]);
     assert.equal(event.decision, 'deny');
     assert.equal(router.selected()?.id, 'second');
+    const createdIn: (string | undefined)[] = [];
+    codex.startSession = async cwd => {
+      createdIn.push(cwd);
+      return { id: 'created-chat', title: 'New session', cwd: '/workspace' };
+    };
+    await send('/session new', 'new-session');
+    await send('/session new', 'new-session');
+    assert.deepEqual(createdIn, ['/workspace']);
+    assert.match(texts.at(-1)!, /New Codex session created and selected/);
+    assert.equal(new Router(join(dir, 'state.json')).textTarget()?.id, 'created-chat');
+    await send('First instruction', 'new-session-first-text');
+    assert.deepEqual(deliveries.at(-1), ['created-chat', 'First instruction']);
   } finally { bridge.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -303,7 +326,7 @@ test('Flux receives phone audio in 80 ms frames and forwards only confirmed turn
   } finally { flux.close(); }
 });
 
-test('a caller correction clears playback and keeps speech after "wait" in the same reply', t => {
+test('a caller correction clears playback and keeps speech after "wait" in the same reply', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   class Socket extends EventEmitter {
     readyState = WebSocket.OPEN;
@@ -315,8 +338,13 @@ test('a caller correction clears playback and keeps speech after "wait" in the s
   }
   const phone = new Socket(), ai = new Socket(), flux = new Socket();
   const button = async () => {};
+  const settingsCalls: unknown[] = [];
   bridgeVoice(phone as unknown as WebSocket, { ...config, DEEPGRAM_API_KEY: 'test-key' },
-    { callSid: 'call', sessionId: 'chat' }, { status: button, submit: button, queue: button, hangup: button },
+    { callSid: 'call', sessionId: 'chat' }, {
+      status: button, submit: button, queue: button, hangup: button,
+      changeSettings: async settings => { settingsCalls.push(settings); return { applied: true }; },
+      usage: async () => ({ fiveHourPercentLeft: 66, weeklyPercentLeft: 50 }),
+    },
     url => (url.hostname === 'api.deepgram.com' ? flux : ai) as unknown as WebSocket);
   try {
     phone.receive({ event: 'start', start: { callSid: 'call', streamSid: 'stream', mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000 } } });
@@ -344,6 +372,12 @@ test('a caller correction clears playback and keeps speech after "wait" in the s
     t.mock.timers.tick(850);
     assert.deepEqual(ai.sent.slice(-2).map(event => event.type), ['conversation.item.create', 'response.create']);
     assert.equal(ai.sent.at(-2).item.content[0].text, 'Wait. Make that cobalt.');
+    ai.receive({ type: 'response.function_call_arguments.done', name: 'change_settings', call_id: 'change',
+      arguments: JSON.stringify({ model: '6 astra', effort: 'high' }) });
+    ai.receive({ type: 'response.function_call_arguments.done', name: 'get_usage', call_id: 'usage', arguments: '{}' });
+    await Promise.resolve();
+    assert.deepEqual(settingsCalls, [{ model: '6 astra', effort: 'high' }]);
+    assert.deepEqual(JSON.parse(ai.sent.at(-1).item.output), { fiveHourPercentLeft: 66, weeklyPercentLeft: 50 });
   } finally { phone.receive({ event: 'stop' }); }
 });
 
@@ -566,11 +600,17 @@ test('an iMessage final reply survives restart and goes only to its matching tur
     session_id: 'chat', cwd: '/workspace', hook_event_name: 'Stop', turn_id, last_assistant_message,
   });
   try {
-    router.select({ id: 'chat', cwd: '/workspace', title: 'Selected' });
+    router.select({ id: 'another-chat', cwd: '/workspace', title: 'Another chat' });
     await hook('desktop-done', 'Finished the work.');
     await hook('desktop-done', 'Finished the work.');
     assert.deepEqual(actions.splice(0), [['text', 'Done']]);
     assert.deepEqual(router.state.events, {});
+    const saved = new Router(join(dir, 'state.json'));
+    assert.equal(saved.textTarget()?.id, 'chat');
+    assert.equal(saved.selected()?.id, 'another-chat');
+    saved.select({ id: 'another-chat', cwd: '/workspace', title: 'Another chat' });
+    assert.equal(saved.textTarget()?.id, 'another-chat');
+    router.save();
     const call = router.queue('chat', 'Task from a call', 'call:instruction');
     Object.assign(call, { remote: true, uncertain: true });
     await handleHook({ session_id: 'chat', cwd: '/workspace', hook_event_name: 'UserPromptSubmit',
