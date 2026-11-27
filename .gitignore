@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.backup-*
+hooks.generated.json
+com.user.codex-voice-bridge.plist
