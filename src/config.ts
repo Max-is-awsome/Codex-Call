@@ -19,6 +19,7 @@ export function serverConfig() {
     SIGNALWIRE_PROJECT_ID: z.string().uuid(), SIGNALWIRE_API_TOKEN: z.string().min(10),
     SIGNALWIRE_SIGNING_KEY: z.string().min(10), SIGNALWIRE_PHONE_NUMBER: phone, USER_PHONE_NUMBER: phone,
     OPENAI_API_KEY: z.string().min(10), OPENAI_REALTIME_MODEL: z.string().min(1).default('gpt-realtime'),
+    DEEPGRAM_API_KEY: z.string().trim().optional(),
     CLAW_API_KEY: z.preprocess(value => value || undefined, z.string().regex(/^cm_live_[A-Za-z0-9_-]+$/).optional()),
     PUBLIC_WEBHOOK_URL: httpsOrigin,
     BRIDGE_TOKEN: z.string().min(32),

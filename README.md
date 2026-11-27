@@ -35,6 +35,8 @@ Store credentials in the local `.env` file. The [SignalWire credentials guide](h
 
 Claw Messenger receives the alert text and its reply. Phone audio is sent to OpenAI for processing. Call and API usage can incur charges.
 
+To use Deepgram Flux for voice turn detection, add a project API key as `DEEPGRAM_API_KEY` in your local `.env` and restart the bridge. Flux receives caller audio and sends confirmed turns as text to OpenAI. The bridge can use OpenAI's voice turn detection if Flux is unavailable. Fish Audio still handles spoken replies. [Deepgram Flux setup](https://developers.deepgram.com/docs/flux/quickstart)
+
 ## Tunnel and activation — finish with Codex
 
 Configure ngrok with your own account, or use an existing Cloudflare tunnel.
@@ -72,15 +74,26 @@ Until those steps pass, live audio, actual iPhone delivery, and the account's ph
 
 ## How session delivery works
 
-The daemon is the single owner of a private, atomically written state file. Hooks and MCP use an authenticated local HTTP API. A plain reply goes to the latest request that asked for a response. The daemon rejects group messages and echoes, and saves the first matching reply before canceling escalation. The bridge sends other texts and incoming reactions directly to the chat owner, steering an active Codex turn or starting one when idle. If no direct receiver is available, the bridge saves the message for the next lifecycle hook. Reactions never decide an approval. Each event gets at most one call attempt. If a reply races with the call request, the daemon tries to stop the call once SignalWire returns its ID.
+The daemon is the single owner of a private, atomically written state file. Hooks and MCP use an authenticated local HTTP API. Text `/sessions` and reply with a number to choose a Codex chat. The menu keeps its numbering until you choose or cancel. The bridge remembers your selection across restarts. Replies to a specific question stay associated with the originating session. The daemon rejects group messages and echoes, and saves the first matching reply before canceling escalation. The bridge sends other texts and incoming reactions directly to the chat owner, steering an active Codex turn or starting one when idle. If no direct receiver is available, the bridge saves the message for the next lifecycle hook. A thumbs-up or thumbs-down on an eligible command approval goes back to the exact desktop approval request. Requests marked for review in Codex stay in the app. Each event gets at most one call attempt. If a reply races with the call request, the daemon tries to stop the call once SignalWire returns its ID.
 
-For a turn started or steered by an iMessage, the bridge keeps the typing indicator active and sends the final answer when the matching Codex turn stops. A bare yes or no to a question can become a 👍 or 👎, and a short acknowledgment can become a ❤️. Codex can also choose one of these reactions with `thumbs_up_imessage`. Desktop-only turns do not send a mirrored answer.
+`/model <name>` changes the model for the next turn in the selected chat. For example, `/model sol 6.2` and `/model 6 astra` match models in Codex’s catalog. The session switch confirmation names the chat. Subsequent replies omit the session prefix.
 
-The desktop app owns its chats independently of the separate managed Codex daemon. The bridge uses the desktop's local IPC for those chats, with lifecycle hooks and MCP polling as a fallback. Routine turn completions do not alert or call. The Stop hook still picks up any already queued instructions. Explicit questions and blockers use the phone MCP tool, which returns the iMessage reply to Codex. The permission hook lets native review continue and asks the bridge to check briefly for an actual desktop approval prompt. Hourly project status iMessages are one-way and never schedule a call. If the desktop app is closed, a chat can pick up saved instructions on its next hook or MCP check.
+Use `/effort low`, `/effort medium`, `/effort high`, `/effort extra high`, or `/effort ultra` to change the selected chat’s reasoning effort for the next turn. `low` is labeled Light in Codex. The bridge checks whether the current model supports the requested level.
+
+New chats use your Codex defaults. To start with GPT‑6.2 Sol and medium effort, set these top-level values in your Codex `config.toml`:
+
+```toml
+model = "gpt-6.2-sol"
+model_reasoning_effort = "medium"
+```
+
+For a turn started or steered by an iMessage, the bridge keeps the typing indicator active and sends the final answer when the matching Codex turn stops. A bare yes or no to a question can become a 👍 or 👎, and a short acknowledgment can become a ❤️. An early reaction with `thumbs_up_imessage` and `keep_reply=true` preserves typing and the final text reply. Desktop-only turns do not send a mirrored answer.
+
+The desktop app owns its chats independently of the separate managed Codex daemon. The bridge uses the desktop's local IPC for those chats, with lifecycle hooks and MCP polling as a fallback. When a desktop turn finishes, the bridge sends a one-way iMessage containing only `Done`. iMessage turns already get their final reply. Completion messages never schedule a call. The Stop hook still picks up any already queued instructions. Explicit questions and blockers use the phone MCP tool, which returns the iMessage reply to Codex. The permission hook lets native review continue and asks the bridge to check briefly for an actual desktop approval prompt. Hourly project status iMessages are one-way and never schedule a call. If the desktop app is closed, a chat can pick up saved instructions on its next hook or MCP check.
 
 For chats loaded in the managed app-server daemon, the bridge can submit directly through that daemon's WebSocket control socket. It refuses to silently resume a chat under another owner. An uncertain submission is flagged for review instead of being automatically replayed.
 
-Inbound calls bind to the most recently active, non-ended session registered within the past day. The bridge checks SignalWire's webhook signature and the caller ID. Confirmed desktop approvals get a reminder to review them in Codex. The bridge checks that the request is still waiting before a call. Ordinary texts still go to the chat.
+Inbound calls start in the selected iMessage session. Outbound calls start in the session that requested the call. Ask to list sessions or switch by title during either call. A call’s selection has no effect on iMessage routing. The bridge checks SignalWire's webhook signature and the caller ID. Confirmed desktop approvals get a reminder to review them in Codex. The bridge checks that the request is still waiting before a call. Ordinary texts still go to the chat.
 
 The Mac must remain awake and online. Restarting the bridge preserves event acknowledgments and dial attempts, but active audio calls are not resumed. Calls are limited to five minutes and outbound attempts are spaced at least one minute apart. Event history and delivered instructions are retained for seven days; undelivered instructions are kept for review.
 

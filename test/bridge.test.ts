@@ -14,9 +14,11 @@ import { projectRoot, type Config } from '../src/config.js';
 import { handleHook } from '../src/escalate-hook.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { isPlaybackEcho, streamSpeech } from '../src/voice-session.js';
-import { Claw, parseClawMessage, parseClawReaction, type ClawMessage } from '../src/claw.js';
-import { CodexClient } from '../src/codex-client.js';
+import { bridgeVoice, isPlaybackEcho, streamSpeech, waitForCallerTurn } from '../src/voice-session.js';
+import { openFlux } from '../src/deepgram-flux.js';
+import { latestUsageLimit } from '../src/usage-limit.js';
+import { Claw, parseClawMessage, parseClawReaction, type ClawMessage, type ClawReaction } from '../src/claw.js';
+import { CodexClient, matchModel } from '../src/codex-client.js';
 
 const config: Config = {
   SIGNALWIRE_SPACE_URL: 'https://example.signalwire.com', SIGNALWIRE_PROJECT_ID: '00000000-0000-4000-8000-000000000001',
@@ -26,6 +28,56 @@ const config: Config = {
   BRIDGE_TOKEN: 'a'.repeat(64), ELEVENLABS_VOICE_ID: 'test-voice', PORT: 3456, ESCALATION_TIMEOUT_SECONDS: 60, CODEX_BIN: 'codex',
 };
 function tempRouter() { const dir = mkdtempSync(join(tmpdir(), 'voice-test-')); return { dir, router: new Router(join(dir, 'state.json')) }; }
+
+test('model aliases match either word order and preserve the full version', () => {
+  const catalog = [
+    { model: 'gpt-6.2-sol', displayName: 'GPT-6.2-Sol' },
+    { model: 'gpt-6-astra', displayName: 'GPT-6-Astra' },
+    { model: 'gpt-6.2-astra', displayName: 'GPT-6.2-Astra' },
+  ];
+  assert.equal(matchModel('sol 6.2', catalog), catalog[0]);
+  assert.equal(matchModel('6 astra', catalog), catalog[1]);
+  assert.equal(matchModel('GPT-6.2-Astra', catalog), catalog[2]);
+  assert.equal(matchModel('astra', catalog), undefined);
+});
+
+test('model selection includes models on later catalog pages', async () => {
+  const client = new CodexClient('/unused', '/nonexistent-codex-desktop.sock');
+  const calls: unknown[] = [];
+  client.withClient = async run => run(async (method, params) => {
+    const request = params as { cursor?: string };
+    calls.push([method, params]);
+    if (method === 'thread/read') return { thread: { id: 'chat', modelProvider: 'provider' } };
+    if (method === 'model/list') return request.cursor
+      ? { data: [{ model: 'gpt-6-luna', displayName: 'GPT-6-Luna' }] }
+      : { data: [{ model: 'gpt-6.2-sol', displayName: 'GPT-6.2-Sol' }], nextCursor: 'next' };
+    if (method === 'thread/list') return { data: [{ id: 'chat', name: 'Chat', cwd: '/workspace' }] };
+    if (method === 'thread/settings/update') return {};
+    throw new Error(`Unexpected RPC ${method}`);
+  });
+  client.sessions = async () => [{ id: 'chat', title: 'Chat', cwd: '/workspace' }];
+  assert.equal(await client.setModel('chat', 'luna 6'), 'GPT-6-Luna');
+  assert.deepEqual(calls.at(-1), ['thread/settings/update', { threadId: 'chat', model: 'gpt-6-luna' }]);
+});
+
+test('usage alerts match recent top-level turn failures and ignore ordinary errors', async () => {
+  const { dir } = tempRouter();
+  const file = join(dir, 'rollout.jsonl'), now = Date.now();
+  const record = (type: string, error: string, turn_id: string, root_turn_id = turn_id) =>
+    JSON.stringify({ type: 'event_msg', timestamp: new Date(now).toISOString(), payload: {
+      type, error: { codex_error_info: error }, turn_id, root_turn_id,
+    } });
+  try {
+    writeFileSync(file, [
+      record('task_complete', 'usage_limit_exceeded', 'user-turn'),
+      record('task_complete', 'usage_limit_exceeded', 'child-turn', 'parent-turn'),
+      record('task_complete', 'rate_limit_exceeded', 'rate'),
+      record('other', 'usage_limit_exceeded', 'unrelated'),
+    ].join('\n'));
+    assert.equal(await latestUsageLimit(file, now), 'user-turn');
+    assert.equal(await latestUsageLimit(file, now + 1), undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('iMessages steer a running desktop chat or start an idle one', async () => {
   const dir = mkdtempSync(join('/tmp', 'voice-ipc-'));
@@ -99,6 +151,9 @@ test('ordinary iMessage follow-ups are queued with no open question and deduplic
   try {
     router.touch('chat', '/workspace');
     const message = { text: 'Can you check the latest build?', messageId: 'follow-up-1' };
+    assert.equal(router.followUp(message), undefined);
+    router.select({ id: 'chat', cwd: '/workspace', title: 'Selected' });
+    router.touch('another-chat', '/another-workspace');
     assert.equal(router.textReply(message), undefined);
     assert.equal(router.followUp(message)?.sessionId, 'chat');
     assert.equal(router.followUp(message), undefined);
@@ -109,6 +164,65 @@ test('ordinary iMessage follow-ups are queued with no open question and deduplic
     router.followUp({ ...message, messageId: 'same-text' });
     assert.equal(router.reactionTarget('chat', '/workspace', message.text), undefined);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the session menu keeps its numbering and reactions return to the originating approval', async () => {
+  const { dir, router } = tempRouter();
+  const codex = new CodexClient();
+  const first = { id: 'first', title: 'First chat', cwd: '/workspace' };
+  const second = { id: 'second', title: 'Second chat', cwd: '/workspace' };
+  let choices = [first, second];
+  codex.sessions = async () => choices;
+  const deliveries: string[][] = [], decisions: unknown[][] = [], texts: string[] = [];
+  codex.deliverText = async (id, text) => { deliveries.push([id, text]); return {}; };
+  codex.decideApproval = async (...args) => { decisions.push(args); return true; };
+  let receive: (message: ClawMessage) => void;
+  let react: (reaction: ClawReaction) => void;
+  class Messenger extends Claw {
+    constructor(c: Config, incoming: typeof receive, reaction?: typeof react) {
+      super(c, incoming, reaction); receive = incoming; react = reaction!;
+    }
+    async send(message: string) { texts.push(message); }
+  }
+  const bridge = createBridge(config, router, new Providers(config), codex, Messenger);
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const send = async (text: string, messageId: string) => {
+    receive!({ type: 'message', from: config.USER_PHONE_NUMBER, text, messageId });
+    await settle();
+  };
+  try {
+    await send('/sessions', 'menu');
+    assert.match(texts.at(-1)!, /1\. First chat\n2\. Second chat/);
+    assert.deepEqual(new Router(join(dir, 'state.json')).state.sessionMenu, ['first', 'second']);
+    choices = [second, first];
+    await send('2', 'selection');
+    assert.equal(new Router(join(dir, 'state.json')).selected()?.id, 'second');
+    const changes: string[][] = [];
+    codex.setModel = async (id, input) => { changes.push([id, input]); return 'GPT-6.2-Sol'; };
+    await send('/model sol 6.2', 'model-selection');
+    await send('/model sol 6.2', 'model-selection');
+    assert.deepEqual(changes, [['second', 'sol 6.2']]);
+    assert.equal(texts.at(-1), 'Model set to GPT-6.2-Sol for the next turn.');
+    codex.setEffort = async (id, effort) => { changes.push([id, effort]); return effort !== 'ultra'; };
+    await send('/effort low', 'effort-low');
+    assert.equal(texts.at(-1), 'Effort set to low for the next turn.');
+    await send('/effort extra high', 'effort-extra-high');
+    assert.deepEqual(changes.slice(1), [['second', 'low'], ['second', 'xhigh']]);
+    await send('/effort ultra', 'effort-ultra');
+    assert.equal(texts.at(-1), 'The selected model doesn’t support ultra effort.');
+    router.touch(first.id, first.cwd);
+    await send('2', 'ordinary-number');
+    assert.deepEqual(deliveries, [['second', '2']]);
+    const event = router.create(first.id, 'desktop-approval:7', 'npm test', 'approval', 60).event;
+    event.approvalCommand = 'npm test';
+    event.clawMessageId = 'approval-guid';
+    const reaction = { type: 'reaction' as const, from: config.USER_PHONE_NUMBER, messageId: 'approval-guid', reactionType: 'dislike' as const };
+    react!(reaction); react!(reaction);
+    await settle();
+    assert.deepEqual(decisions, [['first', 'desktop-approval:7', 'npm test', false]]);
+    assert.equal(event.decision, 'deny');
+    assert.equal(router.selected()?.id, 'second');
+  } finally { bridge.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('an explicit thumbs-up waits for the matching Claw result', async () => {
@@ -133,6 +247,104 @@ test('echoed notifications are rejected while short answers remain valid', () =>
   assert.ok(isPlaybackEcho(`Codex said: ${notification}`, notification));
   assert.equal(isPlaybackEcho('Fish Audio key saved', notification), false);
   assert.equal(isPlaybackEcho('Yes', notification), false);
+});
+
+test('resumed caller speech cancels the pending response until the next commit', async () => {
+  let count = 0;
+  const turn = waitForCallerTurn(() => count++, 10);
+  turn.committed();
+  turn.cancel();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(count, 0);
+  turn.committed();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(count, 1);
+});
+
+test('Flux receives phone audio in 80 ms frames and forwards only confirmed turns', () => {
+  const frames: Buffer[] = [];
+  const events: unknown[] = [];
+  const socket = Object.assign(new EventEmitter(), {
+    readyState: WebSocket.OPEN, bufferedAmount: 0,
+    send: (data: Buffer) => frames.push(data),
+    close() { socket.emit('close'); },
+  });
+  const flux = openFlux('test-key', {
+    ready: () => events.push('ready'),
+    speaking: text => events.push({ speaking: text }),
+    turn: text => events.push(text),
+    failed: interrupted => events.push({ interrupted }),
+  }, (url, options) => {
+    assert.equal(url.pathname, '/v2/listen');
+    assert.equal(url.searchParams.get('encoding'), 'mulaw');
+    assert.equal(url.searchParams.get('sample_rate'), '8000');
+    assert.equal(url.searchParams.get('keyterm'), 'Fo shizzle my nizzle');
+    assert.equal(options.headers?.Authorization, 'Token test-key');
+    return socket as unknown as WebSocket;
+  });
+  const message = (type: string, extra: object = {}) => socket.emit('message', Buffer.from(JSON.stringify({ type, ...extra })));
+  const turn = (event: string, transcript: string, turn_index = 0) => message('TurnInfo', { event, transcript, turn_index });
+  try {
+    message('Connected');
+    const packet = Buffer.alloc(160, 0x70).toString('base64');
+    for (let i = 0; i < 4; i++) flux.append(packet, true);
+    for (let i = 0; i < 4; i++) flux.append(packet, false);
+    assert.deepEqual(frames, [Buffer.alloc(640, 0xff), Buffer.alloc(640, 0x70)]);
+    turn('StartOfTurn', 'First');
+    turn('EagerEndOfTurn', 'First part');
+    turn('TurnResumed', 'First part');
+    assert.deepEqual(events, ['ready', { speaking: 'First' }, { speaking: 'First part' }]);
+    turn('EndOfTurn', 'First part and second part');
+    turn('EndOfTurn', 'Duplicate');
+    turn('StartOfTurn', '', 1);
+    socket.emit('close');
+    socket.emit('error', new Error('closed'));
+    assert.deepEqual(events, ['ready', { speaking: 'First' }, { speaking: 'First part' }, 'First part and second part', { interrupted: true }]);
+  } finally { flux.close(); }
+});
+
+test('a caller correction clears playback and keeps speech after "wait" in the same reply', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  class Socket extends EventEmitter {
+    readyState = WebSocket.OPEN;
+    bufferedAmount = 0;
+    sent: any[] = [];
+    send(payload: string | Buffer) { this.sent.push(Buffer.isBuffer(payload) ? payload : JSON.parse(payload)); }
+    receive(event: unknown) { this.emit('message', Buffer.from(JSON.stringify(event))); }
+    close() { this.emit('close', 1000); }
+  }
+  const phone = new Socket(), ai = new Socket(), flux = new Socket();
+  const button = async () => {};
+  bridgeVoice(phone as unknown as WebSocket, { ...config, DEEPGRAM_API_KEY: 'test-key' },
+    { callSid: 'call', sessionId: 'chat' }, { status: button, submit: button, queue: button, hangup: button },
+    url => (url.hostname === 'api.deepgram.com' ? flux : ai) as unknown as WebSocket);
+  try {
+    phone.receive({ event: 'start', start: { callSid: 'call', streamSid: 'stream', mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000 } } });
+    flux.receive({ type: 'Connected' });
+    ai.receive({ type: 'session.updated' });
+    ai.receive({ type: 'response.created', response: { id: 'greeting' } });
+    ai.receive({ type: 'response.output_audio.delta', delta: 'old-audio' });
+    phone.receive({ event: 'media', media: { payload: Buffer.alloc(640, 0x70).toString('base64') } });
+    assert.deepEqual(flux.sent[0], Buffer.alloc(640, 0x70));
+    const turn = (event: string, transcript: string, turn_index = 0) => flux.receive({ type: 'TurnInfo', event, transcript, turn_index });
+    turn('StartOfTurn', 'Wait');
+    assert.deepEqual(phone.sent.at(-1), { event: 'clear', streamSid: 'stream' });
+    assert.equal(ai.sent.at(-1).response_id, 'greeting');
+    ai.receive({ type: 'response.output_audio.delta', delta: 'stale-audio' });
+    assert.equal(phone.sent.at(-1).event, 'clear');
+    turn('EndOfTurn', 'Wait.');
+    assert.equal(ai.sent.filter(event => event.type === 'response.create').length, 1);
+    ai.receive({ type: 'response.done', response: { status: 'cancelled', output: [{ type: 'message', id: 'stale-message' }] } });
+    assert.equal(ai.sent.at(-1).type, 'conversation.item.delete');
+    t.mock.timers.tick(500);
+    turn('StartOfTurn', 'Make', 1);
+    t.mock.timers.tick(400);
+    assert.equal(ai.sent.filter(event => event.type === 'response.create').length, 1);
+    turn('EndOfTurn', 'Make that cobalt.', 1);
+    t.mock.timers.tick(850);
+    assert.deepEqual(ai.sent.slice(-2).map(event => event.type), ['conversation.item.create', 'response.create']);
+    assert.equal(ai.sent.at(-2).item.content[0].text, 'Wait. Make that cobalt.');
+  } finally { phone.receive({ event: 'stop' }); }
 });
 
 test('Fish audio requests 8 kHz PCM and converts samples split across chunks to PCMU', async () => {
@@ -308,12 +520,22 @@ test('hooks deliver queued instructions and leave permissions to Codex', async (
     const continuation = await handleHook({ ...identity, hook_event_name: 'Stop', last_assistant_message: 'Done' });
     assert.equal(continuation.decision, 'block');
     assert.equal(Object.keys(router.state.events).length, 0);
+    const question = router.create('hook-session', 'waiting-question', 'Ready?', 'question', 60).event;
+    await handleHook({ ...identity, hook_event_name: 'PreToolUse' });
+    await handleHook({ ...identity, hook_event_name: 'PostToolUse' });
+    assert.equal(question.cancelled, false);
+    await handleHook({ ...identity, hook_event_name: 'UserPromptSubmit' });
+    await handleHook({ ...identity, hook_event_name: 'Interrupt' });
+    assert.equal(question.cancelled, false);
+    await handleHook({ ...identity, hook_event_name: 'SessionEnd' });
+    assert.equal(question.cancelled, true);
+    await handleHook({ ...identity, hook_event_name: 'SessionStart' });
     assert.match(continuation.reason!, /blue version/);
     assert.equal(router.pending('hook-session').length, 0);
     const approvalInput = { ...identity, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'example-command' } };
     assert.deepEqual(await handleHook(approvalInput), {});
     await bridge.tick();
-    assert.equal(Object.keys(router.state.events).length, 0);
+    assert.equal(Object.values(router.state.events).some(event => event.kind === 'approval'), false);
   } finally {
     if (previousPort === undefined) delete process.env.PORT; else process.env.PORT = previousPort;
     if (previousToken === undefined) delete process.env.BRIDGE_TOKEN; else process.env.BRIDGE_TOKEN = previousToken;
@@ -321,19 +543,21 @@ test('hooks deliver queued instructions and leave permissions to Codex', async (
   }
 });
 
-test('only the iMessage turn sends a final reply and a bare no can become a reaction', async () => {
+test('an iMessage final reply survives restart and goes only to its matching turn', async () => {
   const { dir, router } = tempRouter();
   const actions: unknown[] = [];
+  let clawReady = true;
   let receive: (message: ClawMessage) => void;
   class Messenger extends Claw {
     constructor(c: Config, incoming: (message: ClawMessage) => void) { super(c, incoming); receive = incoming; }
+    get connected() { return clawReady; }
     typing(active: boolean) { actions.push(['typing', active]); }
     async send(text: string) { actions.push(['text', text]); }
     async react(id: string, type: string) { actions.push(['reaction', id, type]); return true; }
   }
   const codex = new CodexClient();
   codex.deliverText = async () => ({ turnId: 'phone-turn' });
-  const bridge = createBridge(config, router, new Providers(config), codex, Messenger);
+  let bridge = createBridge(config, router, new Providers(config), codex, Messenger);
   await once(bridge.server.listen(0, '127.0.0.1'), 'listening');
   const oldPort = process.env.PORT, oldToken = process.env.BRIDGE_TOKEN;
   process.env.PORT = String((bridge.server.address() as { port: number }).port);
@@ -342,7 +566,17 @@ test('only the iMessage turn sends a final reply and a bare no can become a reac
     session_id: 'chat', cwd: '/workspace', hook_event_name: 'Stop', turn_id, last_assistant_message,
   });
   try {
-    router.touch('chat', '/workspace');
+    router.select({ id: 'chat', cwd: '/workspace', title: 'Selected' });
+    await hook('desktop-done', 'Finished the work.');
+    await hook('desktop-done', 'Finished the work.');
+    assert.deepEqual(actions.splice(0), [['text', 'Done']]);
+    assert.deepEqual(router.state.events, {});
+    const call = router.queue('chat', 'Task from a call', 'call:instruction');
+    Object.assign(call, { remote: true, uncertain: true });
+    await handleHook({ session_id: 'chat', cwd: '/workspace', hook_event_name: 'UserPromptSubmit',
+      turn_id: 'voice-turn', prompt: call.text });
+    await hook('voice-turn', 'Finished the work from the call.');
+    assert.deepEqual(actions, []);
     receive!({ type: 'message', from: config.USER_PHONE_NUMBER, messageId: 'first', text: 'What is the status?' });
     await hook('desktop-turn', 'Private desktop reply');
     assert.deepEqual(actions, [['typing', true]]);
@@ -353,6 +587,28 @@ test('only the iMessage turn sends a final reply and a bare no can become a reac
     await new Promise(resolve => setImmediate(resolve));
     await hook('phone-turn', 'No.');
     assert.deepEqual(actions.slice(-3), [['typing', true], ['typing', false], ['reaction', 'second', 'dislike']]);
+    const reminder = 'Keep .env out of Git';
+    receive!({ type: 'message', from: config.USER_PHONE_NUMBER, messageId: 'third', text: reminder });
+    const response = await fetch(`http://127.0.0.1:${process.env.PORT}/internal/react`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${config.BRIDGE_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'chat', cwd: '/workspace', message: reminder, keepReply: true }),
+    });
+    assert.deepEqual(await response.json(), { sent: true });
+    assert.deepEqual(actions.slice(-2), [['typing', true], ['reaction', 'third', 'like']]);
+    assert.equal(router.state.mirroredReplies?.chat.reaction, 'acknowledgment');
+    bridge.close();
+    clawReady = false;
+    const restored = new Router(join(dir, 'state.json'));
+    bridge = createBridge(config, restored, new Providers(config), codex, Messenger);
+    await once(bridge.server.listen(0, '127.0.0.1'), 'listening');
+    process.env.PORT = String((bridge.server.address() as { port: number }).port);
+    await hook('phone-turn', 'I verified .env stays local.');
+    assert.equal(restored.state.mirroredReplies?.chat.finalText, 'I verified .env stays local.');
+    clawReady = true;
+    await bridge.tick();
+    assert.deepEqual(actions.slice(-2), [['typing', false], ['text', 'I verified .env stays local.']]);
+    assert.equal(restored.state.mirroredReplies?.chat, undefined);
   } finally {
     if (oldPort === undefined) delete process.env.PORT; else process.env.PORT = oldPort;
     if (oldToken === undefined) delete process.env.BRIDGE_TOKEN; else process.env.BRIDGE_TOKEN = oldToken;
@@ -364,6 +620,7 @@ test('only a confirmed desktop approval creates an alert and a plain text still 
   const { dir, router } = tempRouter();
   const codex = new CodexClient();
   codex.approvals = async () => ['desktop-approval:1'];
+  codex.approvalDetails = async () => undefined;
   const bridge = createBridge(config, router, new Providers(config), codex);
   bridge.server.listen(0, '127.0.0.1'); await once(bridge.server, 'listening');
   const previousPort = process.env.PORT, previousToken = process.env.BRIDGE_TOKEN;
@@ -377,6 +634,7 @@ test('only a confirmed desktop approval creates an alert and a plain text still 
     const event = Object.values(router.state.events)[0];
     assert.equal(event?.key, 'desktop-approval:1');
     assert.equal(event.textDecision, false);
+    router.select({ id: 'permission-chat', cwd: '/workspace', title: 'Permissions' });
     const message = { text: 'Use the blue version', messageId: 'valid-claw-reply' };
     assert.equal(router.textReply(message), undefined);
     assert.equal(router.followUp(message)?.sessionId, 'permission-chat');

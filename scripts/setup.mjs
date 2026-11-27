@@ -69,6 +69,7 @@ if (process.argv.includes('--activate')) {
   const bridgeInstructions = `<!-- codex-voice-bridge -->
 When you need the user to answer a question, make a choice, respond to a blocker, or do something so work can continue, ask through voice_bridge.ask_user_via_phone first, even when they are active in Codex. Send the complete question and any choices in one iMessage. Use the exact current chat ID and workspace path. Do not send a duplicate desktop question card. If the bridge is unavailable or the user asks to answer in Codex, use the desktop chat. Treat the returned reply as user input. Native permission prompts stay in Codex.
 Check voice_bridge.check_voice_instructions at natural pauses and acknowledge received instruction IDs. A push acknowledgment is not approval. Review uncertain deliveries against chat history before repeating an action.
+When a consequential iMessage instruction calls for a thoughtful acknowledgment before the work is finished, use voice_bridge.thumbs_up_imessage with keep_reply=true, then continue and send the final answer. Use the exact message text and skip routine receipts.
 <!-- /codex-voice-bridge -->`;
   const bridgeBlock = /<!-- codex-voice-bridge -->[\s\S]*?<!-- \/codex-voice-bridge -->/;
   const updated = bridgeBlock.test(original) ? original.replace(bridgeBlock, bridgeInstructions) : original + '\n' + bridgeInstructions + '\n';

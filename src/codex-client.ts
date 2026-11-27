@@ -2,7 +2,40 @@ import { once } from 'node:events';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket from 'ws';
-import { deliverToDesktop, desktopApprovals } from './desktop-client.js';
+import { z } from 'zod';
+import { deliverToDesktop, desktopApprovals, desktopApprovalDetails, desktopDecideApproval, desktopUpdateSettings, desktopModelSettings } from './desktop-client.js';
+
+const listedSession = z.object({ id: z.string().uuid(), name: z.string().nullable(), cwd: z.string(), preview: z.string().optional() });
+export type SessionChoice = { id: string; title: string; cwd: string };
+const modelWords = (name: string) => name.toLowerCase().match(/[a-z]+|\d+(?:\.\d+)*/g)
+  ?.filter(word => word !== 'gpt').sort().join(' ');
+
+type CatalogModel = { model: string; displayName: string; hidden?: boolean; supportedReasoningEfforts?: { reasoningEffort: string }[] };
+type Rpc = (method: string, params: unknown) => Promise<any>;
+
+export function matchModel(input: string, catalog: CatalogModel[]) {
+  const visible = catalog.filter(entry => !entry.hidden);
+  const exact = visible.find(entry => entry.model.toLowerCase() === input.trim().toLowerCase());
+  if (exact) return exact;
+  const wanted = modelWords(input);
+  if (!wanted) return;
+  const matches = visible.filter(entry => modelWords(entry.model) === wanted || modelWords(entry.displayName) === wanted);
+  if (matches.length === 1) return matches[0];
+}
+
+async function modelCatalog(rpc: Rpc, modelProvider?: string): Promise<CatalogModel[]> {
+  const models = new Map<string, CatalogModel>();
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await rpc('model/list', { limit: 100, modelProvider, cursor });
+    for (const model of page.data as CatalogModel[]) models.set(model.model, model);
+    cursor = page.nextCursor;
+    if (!cursor || seen.has(cursor)) break;
+    seen.add(cursor);
+  } while (cursor);
+  return [...models.values()];
+}
 
 export class DeliveryError extends Error {
   constructor(public uncertain: boolean) { super(uncertain ? 'Delivery is uncertain' : 'Chat is unavailable on this daemon'); }
@@ -48,8 +81,68 @@ export class CodexClient {
   async status(threadId: string) {
     return this.withClient(async rpc => (await rpc('thread/read', { threadId, includeTurns: false })).thread);
   }
+  async setModel(threadId: string, input: string) {
+    return this.withClient(async rpc => {
+      const { thread } = await rpc('thread/read', { threadId, includeTurns: false });
+      if (thread.id !== threadId) throw new Error('Selected chat is unavailable');
+      const match = matchModel(input, await modelCatalog(rpc, thread.modelProvider));
+      if (!match) return;
+      await this.updateSettings(rpc, threadId, { model: match.model });
+      return match.displayName;
+    });
+  }
+  async setEffort(threadId: string, effort: string) {
+    return this.withClient(async rpc => {
+      const { thread } = await rpc('thread/read', { threadId, includeTurns: false });
+      if (thread.id !== threadId) throw new Error('Selected chat is unavailable');
+      const settings = await desktopModelSettings(this.desktopPath, threadId);
+      const modelId = settings?.model ?? thread.model;
+      const model = (await modelCatalog(rpc, thread.modelProvider)).find(entry => entry.model === modelId);
+      if (!model?.supportedReasoningEfforts) throw new Error('Current model effort options are unavailable');
+      const supported = model.supportedReasoningEfforts;
+      if (!Array.isArray(supported) || !supported.some(option => option.reasoningEffort === effort)) return false;
+      await this.updateSettings(rpc, threadId, { effort });
+      return true;
+    });
+  }
+  private async updateSettings(rpc: (method: string, params: unknown) => Promise<unknown>, threadId: string,
+    settings: { model?: string; effort?: string }) {
+    const applied = await desktopUpdateSettings(this.desktopPath, threadId, settings);
+    if (applied === false) throw new Error('Desktop rejected settings change');
+    if (applied === undefined) {
+      if (!(await this.sessions()).some(session => session.id === threadId)) throw new Error('Selected chat is unavailable');
+      await rpc('thread/settings/update', { threadId, ...settings });
+    }
+  }
+  async sessions(): Promise<SessionChoice[]> {
+    return this.withClient(async rpc => {
+      const sessions = new Map<string, SessionChoice>();
+      let cursor: string | null = null;
+      do {
+        const page = await rpc('thread/list', { cursor, limit: 50, archived: false, currentAccountOnly: true });
+        for (const item of page.data ?? []) {
+          if (item.parentThreadId || item.ephemeral) continue;
+          const row = listedSession.safeParse(item);
+          if (!row.success) continue;
+          const { id, name, cwd, preview } = row.data;
+          const title = (name?.trim() || preview?.trim() || 'Untitled session').replace(/\s+/g, ' ').slice(0, 100);
+          sessions.set(id, { id, cwd, title });
+        }
+        const next = page.nextCursor ?? null;
+        if (next === cursor) break;
+        cursor = next;
+      } while (cursor);
+      return [...sessions.values()];
+    });
+  }
   approvals(threadId: string) {
     return desktopApprovals(this.desktopPath, threadId).catch(() => undefined);
+  }
+  approvalDetails(threadId: string, key: string) {
+    return desktopApprovalDetails(this.desktopPath, threadId, key).catch(() => undefined);
+  }
+  decideApproval(threadId: string, key: string, command: string, allow: boolean) {
+    return desktopDecideApproval(this.desktopPath, threadId, key, command, allow);
   }
   async deliverText(threadId: string, text: string, messageId: string) {
     try {
@@ -63,7 +156,11 @@ export class CodexClient {
     try {
       return await this.withClient(async rpc => {
         const { thread } = await rpc('thread/read', { threadId, includeTurns: false });
-        if (thread.id !== threadId || thread.status?.type === 'notLoaded') throw new Error('Target chat is not loaded');
+        if (thread.id !== threadId) throw new Error('Target chat is unavailable');
+        if (thread.status?.type === 'notLoaded') {
+          if (!(await this.sessions()).some(session => session.id === threadId)) throw new Error('Target chat is unavailable');
+          await rpc('thread/resume', { threadId, excludeTurns: true });
+        }
         sent = true;
         const { turn } = await rpc('turn/start', { threadId, clientUserMessageId: messageId, input: [{ type: 'text', text, text_elements: [] }] });
         return { turnId: turn?.id as string | undefined };

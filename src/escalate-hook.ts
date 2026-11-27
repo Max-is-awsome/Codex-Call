@@ -11,7 +11,8 @@ export async function handleHook(payload: Record<string, any>) {
   if (!['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'PermissionRequest', 'SessionEnd', 'Interrupt'].includes(kind)) return {};
   await localRequest('/activity', { sessionId: id, cwd: payload.cwd,
     summary: typeof payload.last_assistant_message === 'string' ? payload.last_assistant_message.slice(0, 4000) : undefined,
-    ended: kind === 'SessionEnd', cancel: !['Stop', 'PermissionRequest'].includes(kind),
+    ended: kind === 'SessionEnd',
+    transcript: typeof payload.transcript_path === 'string' ? payload.transcript_path : undefined,
   });
   const readInstructions = async () => {
     const { instructions } = await localRequest('/instructions', { sessionId: id });

@@ -12,9 +12,13 @@ type Frame = {
   sourceClientId?: string;
   params?: {
     conversationId?: string;
-    change?: { type?: string; conversationState?: { requests?: { method?: string; id?: unknown }[] } };
+    change?: { type?: string; conversationState?: { requests?: DesktopRequest[] } };
   };
 };
+type DesktopRequest = { method?: string; id?: unknown; params?: {
+  threadId?: string; turnId?: string; itemId?: string; startedAtMs?: number;
+  command?: string; kind?: string; reason?: string; networkApprovalContext?: unknown;
+} };
 
 // shortcut: the desktop IPC is versioned but private; use lifecycle delivery if the desktop stops accepting it.
 async function withDesktop<T>(path: string, threadId: string, run: (client: {
@@ -101,13 +105,62 @@ async function withDesktop<T>(path: string, threadId: string, run: (client: {
 }
 
 const approvalMethods = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval']);
+const approvalKey = (request: DesktopRequest) => `desktop-approval:${JSON.stringify([
+  request.id, request.params?.turnId, request.params?.itemId, request.params?.startedAtMs,
+])}`;
+function reviewableCommand(entry: DesktopRequest | undefined, threadId: string) {
+  const p = entry?.params;
+  if (entry?.method !== 'item/commandExecution/requestApproval' || !p || p.threadId !== threadId
+    || !p.turnId || !p.itemId || !Number.isFinite(p.startedAtMs)
+    || p.kind !== 'command' || p.networkApprovalContext || p.reason || typeof p.command !== 'string') return;
+  const command = p.command.trim();
+  if (command && command.length <= 600
+    && !/[\r\n]|cm_live_|swapi_|sk-(?:proj-)?[A-Za-z0-9_-]{12,}|(?:api[_-]?key|token|password|secret|authorization)\s*[:=]/i.test(command)) return command;
+}
+
+export async function desktopApprovalDetails(path: string, threadId: string, key: string) {
+  return withDesktop(path, threadId, async ({ snapshot }) => {
+    const frame = await snapshot();
+    const entry = frame.params?.change?.conversationState?.requests?.find(r => approvalKey(r) === key);
+    return reviewableCommand(entry, threadId);
+  });
+}
+
+export async function desktopDecideApproval(path: string, threadId: string, key: string, command: string, allow: boolean) {
+  return withDesktop(path, threadId, async ({ snapshot, request, owner }) => {
+    const frame = await snapshot();
+    const entry = frame.params?.change?.conversationState?.requests?.find(r => approvalKey(r) === key);
+    if (!entry || reviewableCommand(entry, threadId) !== command) return false;
+    const result = await request('thread-follower-command-approval-decision', 1,
+      { conversationId: threadId, requestId: entry.id, decision: allow ? 'accept' : 'decline' }, owner);
+    return result.resultType === 'success';
+  });
+}
 
 export async function desktopApprovals(path: string, threadId: string) {
   return withDesktop(path, threadId, async ({ snapshot }) => {
     const frame = await snapshot();
     const requests = frame.params?.change?.conversationState?.requests;
     return Array.isArray(requests) ? requests.filter(r => r?.method && approvalMethods.has(r.method)
-      && (typeof r.id === 'string' || typeof r.id === 'number')).map(r => `desktop-approval:${JSON.stringify(r.id)}`) : undefined;
+      && (typeof r.id === 'string' || typeof r.id === 'number')).map(approvalKey) : undefined;
+  });
+}
+
+export function desktopUpdateSettings(path: string, threadId: string, threadSettings: { model?: string; effort?: string }) {
+  return withDesktop(path, threadId, async ({ request, owner }) => {
+    const response = await request('thread-follower-update-thread-settings', 2,
+      { conversationId: threadId, threadSettings }, owner);
+    return response.resultType === 'success'
+      && (response.result as { applied?: boolean } | undefined)?.applied === true;
+  });
+}
+
+export function desktopModelSettings(path: string, threadId: string) {
+  return withDesktop(path, threadId, async ({ request, owner }) => {
+    const response = await request('thread-follower-read-model-settings', 1, { conversationId: threadId }, owner);
+    if (response.resultType === 'success') {
+      return (response.result as { settings?: { model?: string; reasoningEffort?: string } } | undefined)?.settings;
+    }
   });
 }
 
